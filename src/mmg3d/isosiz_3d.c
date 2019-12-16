@@ -497,6 +497,52 @@ double MMG5_meansizreg_iso(MMG5_pMesh mesh,MMG5_pSol met,int nump,int *lists,
 /**
  * \param mesh pointer toward the mesh structure.
  * \param met pointer toward the metric structure.
+ * \param ip0 index of the first edge extremity
+ * \param ip1 index of the second edge extremity
+ *
+ * \return 1 if success, 0 if fail.
+ *
+ * Compute the euclidean length of the edge \a ip0 \a ip1,
+ * add this length to the metric of the edge extremities and
+ * increment the count of times we have processed this extremities.
+ *
+ */
+int MMG3D_sum_reqMetricsAtPoint ( MMG5_pMesh mesh,MMG5_pSol met,MMG5_Hash *hash,double *med_m,int ip0,int ip1 ) {
+  MMG5_pPoint p0,p1;
+  int         iadr0,iadr1,j;
+  double      mi0[6],mi1[6];
+
+  /* Check if the edge is already treated */
+  if ( MMG5_hashGet(hash,ip0,ip1) ) return 1;
+
+  /* Mark the edge as treated */
+  if ( !MMG5_hashEdge(mesh,hash,ip0,ip1,1) ) return 0;
+
+  /* Compute the euclidean edge length */
+  p0 = &mesh->point[ip0];
+  p1 = &mesh->point[ip1];
+
+  iadr0 = met->size*ip0;
+  iadr1 = met->size*ip1;
+
+  MMG5_invmat(&met->m[iadr0],mi0);
+  MMG5_invmat(&met->m[iadr1],mi1);
+
+  /* Add the length to the point's metric and increment the number of
+   * times the point has been seen */
+  for( j=0; j<met->size; j++ ) {
+    med_m[iadr0+j] += mi1[j];
+    med_m[iadr1+j] += mi0[j];
+  }
+  --p0->s;
+  --p1->s;
+
+  return 1;
+}
+
+/**
+ * \param mesh pointer toward the mesh structure.
+ * \param met pointer toward the metric structure.
  * \param hash edge hashtable.
  * \param pt tetra to process.
  * \param i index of the edge of the tetra \a pt that we process.
@@ -529,6 +575,52 @@ int MMG3D_sum_reqEdgeLengthsAtPoint(MMG5_pMesh mesh,MMG5_pSol met,MMG5_Hash *has
 }
 
 /**
+ * \param mesh pointer toward the mesh structure.
+ * \param met pointer toward the metric structure.
+ *
+ * \return 1 if success, 0 if fail.
+ *
+ * Compute the mean metric at mesh points with a non-nul \a s field. At the
+ * beginning, for a given point \a ip, \f$ met->m[met->size * ip] \f$ contains
+ * the sum of n metrics and the \a s field of \a ip contains the number of
+ * metrics summed in the point. Set the flag of the processed points to 3.
+ *
+ */
+int MMG3D_compute_meanMetricTensorAtMarkedPoints ( MMG5_pMesh mesh,MMG5_pSol met, double *med_m ) {
+  MMG5_pPoint p0;
+  int         k,iadr,j;
+  double      mi[6],lambda[3],v[3][3];
+
+  for ( k=1; k<=mesh->np; k++ ) {
+    p0 = &mesh->point[k];
+    if ( !MG_VOK(p0) )  continue;
+
+    if ( p0->s >= 0 ) continue;
+    p0->s = -p0->s;
+
+    iadr = met->size*k;
+
+    for( j=0; j<met->size; j++ )
+      med_m[iadr+j] /= p0->s;
+
+    MMG5_invmat( &med_m[iadr],mi);
+
+//    MMG5_eigenv(1,mi,lambda,v);
+//    assert( (lambda[0] >= MMG5_EPSD2) && (lambda[1] >= MMG5_EPSD2) && (lambda[2] >= MMG5_EPSD2) );
+
+    for( j=0; j<met->size; j++ )
+      met->m[iadr+j] = mi[j];
+
+
+    p0->s = 0;
+
+    p0->flag = 3;
+  }
+
+  return 1;
+}
+
+/**
  * \param mesh pointer toward the mesh
  * \param met pointer toward the metric
  *
@@ -545,6 +637,7 @@ int MMG3D_set_metricAtPointsOnReqEdges ( MMG5_pMesh mesh,MMG5_pSol met) {
   MMG5_Hash    hash;
   int          k,i,j,ip0,ip1,iad0,iad1;
   int8_t       ismet;
+  double       *med_m;
 
   ismet = mesh->info.inputMet;
 
@@ -571,8 +664,8 @@ int MMG3D_set_metricAtPointsOnReqEdges ( MMG5_pMesh mesh,MMG5_pSol met) {
         pxt = &mesh->xtetra[pt->xt];
 
         for ( i=0; i<6; i++ ) {
-          if ( (pxt->tag[i] & MG_REQ) || (pxt->tag[i] & MG_NOSURF) ||
-               (pxt->tag[i] & MG_PARBDY) ) {
+          if ((pxt->tag[i] & MG_PARBDY) && !MG_RID(mesh->point[pt->v[MMG5_iare[i][0]]].tag) ) continue;
+          if ( (pxt->tag[i] & MG_REQ) || (pxt->tag[i] & MG_NOSURF) ) {
             ip0 = pt->v[MMG5_iare[i][0]];
             ip1 = pt->v[MMG5_iare[i][1]];
             iad0 = met->size*ip0;
@@ -586,6 +679,8 @@ int MMG3D_set_metricAtPointsOnReqEdges ( MMG5_pMesh mesh,MMG5_pSol met) {
       }
     }
   }
+
+  MMG5_SAFE_CALLOC(med_m,met->size*(mesh->np+1),double,return 0);
 
   /* Process the required edges and add the edge length to the metric of the
    * edge extremities */
@@ -608,8 +703,12 @@ int MMG3D_set_metricAtPointsOnReqEdges ( MMG5_pMesh mesh,MMG5_pSol met) {
       pxt = &mesh->xtetra[pt->xt];
 
       for ( i=0; i<6; i++ ) {
-        if ( (pxt->tag[i] & MG_REQ) || (pxt->tag[i] & MG_NOSURF) ||
-             (pxt->tag[i] & MG_PARBDY) ) {
+        if ( (pxt->tag[i] & MG_PARBDY) && !MG_RID(mesh->point[pt->v[MMG5_iare[i][0]]].tag)) {
+          if ( !MMG3D_sum_reqMetricsAtPoint(mesh,met,&hash,med_m,pt->v[MMG5_iare[i][0]],pt->v[MMG5_iare[i][1]]) ) {
+            MMG5_DEL_MEM(mesh,hash.item);
+            return 0;
+          }
+        } else if ( (pxt->tag[i] & MG_REQ) || (pxt->tag[i] & MG_NOSURF) ) {
           if ( !MMG3D_sum_reqEdgeLengthsAtPoint(mesh,met,&hash,pt,i) ) {
             MMG5_DEL_MEM(mesh,hash.item);
             return 0;
@@ -619,6 +718,11 @@ int MMG3D_set_metricAtPointsOnReqEdges ( MMG5_pMesh mesh,MMG5_pSol met) {
     }
   }
   MMG5_DEL_MEM(mesh,hash.item);
+
+  if ( !MMG3D_compute_meanMetricTensorAtMarkedPoints ( mesh,met,med_m ) ) {
+    return 0;
+  }
+  MMG5_DEL_MEM(mesh,med_m);
 
   /* Travel the points and compute the metric of the points belonging to
    * required edges as the mean of the required edges length */
